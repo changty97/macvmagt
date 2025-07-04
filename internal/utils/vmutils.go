@@ -25,7 +25,7 @@ type TartVMInfo struct {
 
 // GetRunningVMs uses `tart list --json` to get details of running VMs.
 func GetRunningVMs() ([]models.VMInfo, error) {
-	output, err := ExecuteCommand("tart", "list", "--json")
+	output, err := ExecuteCommand("tart", "list", "--format", "json")
 	if err != nil {
 		// Tart list might return an error if no VMs, or empty JSON array
 		if strings.Contains(err.Error(), "no VMs found") || strings.TrimSpace(output) == "[]" || strings.Contains(err.Error(), "exit status 1") {

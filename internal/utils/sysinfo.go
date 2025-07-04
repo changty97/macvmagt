@@ -76,7 +76,7 @@ func GetMemoryUsage() (float64, float64, error) {
 // GetDiskUsage returns current and total disk usage in GB for the root partition.
 func GetDiskUsage() (float64, float64, error) {
 	// Using 'df -h /' for disk usage.
-	output, err := ExecuteCommand("df", "-g", "/") // -g for GB units
+	output, err := ExecuteCommand("df", "-h") // -g for GB units
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to get disk usage: %w", err)
 	}
