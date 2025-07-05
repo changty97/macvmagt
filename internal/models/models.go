@@ -23,16 +23,13 @@ type HeartbeatPayload struct {
 	CachedImages    []string `json:"cachedImages"`    // List of VM image names cached on this Mac Mini
 }
 
-// VMRequest defines the structure for requesting a new VM from the orchestrator.
-type VMRequest struct {
-	ImageName string `json:"imageName"` // The name of the VM image required
-	// Add other VM configuration parameters here (e.g., CPU, Memory, Disk size)
-}
-
 // VMProvisionCommand represents a command from the orchestrator to provision a VM.
 type VMProvisionCommand struct {
-	VMID      string `json:"vmId"`      // Unique ID for the new VM
-	ImageName string `json:"imageName"` // Image to use for the VM
+	VMID                    string   `json:"vmId"`                    // Unique ID for the new VM
+	ImageName               string   `json:"imageName"`               // Image to use for the VM
+	RunnerRegistrationToken string   `json:"runnerRegistrationToken"` // GitHub Actions runner registration token
+	RunnerName              string   `json:"runnerName"`              // Unique name for the GitHub runner
+	RunnerLabels            []string `json:"runnerLabels"`            // Labels for the GitHub runner
 	// Add other VM configuration details
 }
 
