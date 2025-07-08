@@ -9,35 +9,35 @@ import (
 
 // Config holds all agent-wide configuration settings.
 type Config struct {
-	NodeID             string
-	OrchestratorURL    string
-	HeartbeatInterval  time.Duration
-	ImageCacheDir      string
-	VMsDir             string // Added: Directory for tart VM bundles
-	MaxCachedImages    int
-	GCSBucketName      string
-	GCPCredentialsPath string
-
-	// Removed mTLS Configuration for Agent
-	AgentListenPort string // Port for agent to listen for orchestrator commands
+	NodeID                 string
+	OrchestratorURL        string
+	AgentPort              string // Port the agent listens on for commands from orchestrator
+	HeartbeatInterval      time.Duration
+	ImageCacheDir          string
+	MaxCachedImages        int
+	GCSBucketName          string
+	GCPCredentialsPath     string
+	GitHubRunnerScriptPath string // Path to the install_github_runner.sh.template
+	VMSSHUser              string // SSH user for connecting to VMs
+	VMSSHKeyPath           string // Path to SSH private key for connecting to VMs
 }
 
 // LoadConfig loads configuration from environment variables or uses default values.
 func LoadConfig() *Config {
 	cfg := &Config{
-		NodeID:             getEnv("MACVMORX_AGENT_NODE_ID", "mac-mini-default"),
-		OrchestratorURL:    getEnv("MACVMORX_ORCHESTRATOR_URL", "http://localhost:8080"), // Changed to HTTP
-		HeartbeatInterval:  getEnvDuration("MACVMORX_HEARTBEAT_INTERVAL", 15*time.Second),
-		ImageCacheDir:      getEnv("MACVMORX_IMAGE_CACHE_DIR", "/var/macvmorx/images_cache"),
-		VMsDir:             getEnv("MACVMORX_VMS_DIR", "/var/macvmorx/vms"), // Added default for VMsDir
-		MaxCachedImages:    getEnvInt("MACVMORX_MAX_CACHED_IMAGES", 5),
-		GCSBucketName:      getEnv("MACVMORX_GCS_BUCKET_NAME", "macvmorx-vm-images"),
-		GCPCredentialsPath: getEnv("MACVMORX_GCP_CREDENTIALS_PATH", ""),
-
-		// Removed mTLS Configuration Defaults for Agent
-		AgentListenPort: getEnv("MACVMORX_AGENT_LISTEN_PORT", "8081"), // Port for orchestrator commands
+		NodeID:                 getEnv("MACVMORX_AGENT_NODE_ID", "mac-mini-default"),
+		OrchestratorURL:        getEnv("MACVMORX_ORCHESTRATOR_URL", "http://localhost:8080"),
+		AgentPort:              getEnv("MACVMORX_AGENT_PORT", "8081"),
+		HeartbeatInterval:      getEnvDuration("MACVMORX_HEARTBEAT_INTERVAL", 15*time.Second),
+		ImageCacheDir:          getEnv("MACVMORX_IMAGE_CACHE_DIR", "/var/macvmorx/images_cache"),
+		MaxCachedImages:        getEnvInt("MACVMORX_MAX_CACHED_IMAGES", 5),
+		GCSBucketName:          getEnv("MACVMORX_GCS_BUCKET_NAME", "macvmorx-vm-images"),
+		GCPCredentialsPath:     getEnv("MACVMORX_GCP_CREDENTIALS_PATH", ""),
+		GitHubRunnerScriptPath: getEnv("MACVMORX_GITHUB_RUNNER_SCRIPT_PATH", "/opt/macvmorx-agent/scripts/install_github_runner.sh.template"),
+		VMSSHUser:              getEnv("MACVMORX_VM_SSH_USER", "runner"),
+		VMSSHKeyPath:           getEnv("MACVMORX_VM_SSH_KEY_PATH", "/Users/runner/.ssh/id_rsa"), // Default path for runner user
 	}
-	log.Printf("Loaded agent configuration: %+v", cfg)
+	log.Printf("Agent Loaded configuration: %+v", cfg)
 	return cfg
 }
 

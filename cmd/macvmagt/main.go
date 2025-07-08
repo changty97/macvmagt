@@ -1,16 +1,11 @@
 package main
 
 import (
-	"context"
 	"log"
 	"os"
 
-	"github.com/changty97/macvmagt/internal/api"
+	"github.com/changty97/macvmagt/internal/agent"
 	"github.com/changty97/macvmagt/internal/config"
-	"github.com/changty97/macvmagt/internal/gcs"
-	"github.com/changty97/macvmagt/internal/heartbeat"
-	"github.com/changty97/macvmagt/internal/vm"
-	"github.com/changty97/macvmagt/internal/web"
 	"github.com/spf13/cobra"
 )
 
@@ -21,59 +16,48 @@ func init() {
 	cfg = config.LoadConfig()
 
 	// Use config values as defaults for Cobra flags
-	rootCmd.PersistentFlags().StringVar(&cfg.NodeID, "node-id", cfg.NodeID, "Unique identifier for this Mac Mini node")
+	rootCmd.PersistentFlags().StringVar(&cfg.NodeID, "node-id", cfg.NodeID, "Unique identifier for this Mac Mini agent")
 	rootCmd.PersistentFlags().StringVar(&cfg.OrchestratorURL, "orchestrator-url", cfg.OrchestratorURL, "URL of the macvmorx orchestrator")
+	rootCmd.PersistentFlags().StringVar(&cfg.AgentPort, "agent-port", cfg.AgentPort, "Port the agent listens on for orchestrator commands")
 	rootCmd.PersistentFlags().DurationVar(&cfg.HeartbeatInterval, "heartbeat-interval", cfg.HeartbeatInterval, "How often the agent sends heartbeats")
 	rootCmd.PersistentFlags().StringVar(&cfg.ImageCacheDir, "image-cache-dir", cfg.ImageCacheDir, "Directory for VM image cache")
-	rootCmd.PersistentFlags().StringVar(&cfg.VMsDir, "vms-dir", cfg.VMsDir, "Directory for tart VM bundles") // Added flag for VMsDir
 	rootCmd.PersistentFlags().IntVar(&cfg.MaxCachedImages, "max-cached-images", cfg.MaxCachedImages, "Maximum number of VM images to keep in cache")
-	rootCmd.PersistentFlags().StringVar(&cfg.GCSBucketName, "gcs-bucket-name", cfg.GCSBucketName, "Name of the GCP Cloud Storage bucket")
+	rootCmd.PersistentFlags().StringVar(&cfg.GCSBucketName, "gcs-bucket-name", cfg.GCSBucketName, "Name of the GCP Cloud Storage bucket for VM images")
 	rootCmd.PersistentFlags().StringVar(&cfg.GCPCredentialsPath, "gcp-credentials-path", cfg.GCPCredentialsPath, "Path to GCP service account key JSON file")
-	// Removed mTLS flags for agent
-	rootCmd.PersistentFlags().StringVar(&cfg.AgentListenPort, "listen-port", cfg.AgentListenPort, "Port for agent to listen for orchestrator commands")
+	rootCmd.PersistentFlags().StringVar(&cfg.GitHubRunnerScriptPath, "github-runner-script-path", cfg.GitHubRunnerScriptPath, "Path to the GitHub runner installation script template")
+	rootCmd.PersistentFlags().StringVar(&cfg.VMSSHUser, "vm-ssh-user", cfg.VMSSHUser, "SSH username for connecting to VMs")
+	rootCmd.PersistentFlags().StringVar(&cfg.VMSSHKeyPath, "vm-ssh-key-path", cfg.VMSSHKeyPath, "Path to SSH private key for connecting to VMs")
 }
 
 var rootCmd = &cobra.Command{
 	Use:   "macvmorx-agent",
-	Short: "macvmorx-agent is the client component for MacVMOrx orchestration.",
-	Long: `The agent runs on individual Mac Mini machines, reporting health,
-managing VM images, and provisioning/deleting VMs as instructed by the orchestrator.`,
+	Short: "macvmorx-agent is the client-side component for macOS VM orchestration.",
+	Long: `The macvmorx-agent runs on individual Mac Mini machines to manage VMs,
+report node health, and handle image caching as instructed by the orchestrator.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		startAgent()
 	},
 }
 
 func startAgent() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Configure logging to file if LogFilePath is provided (from orchestrator config, agent doesn't have this directly)
+	// For agent, logs will go to stdout/stderr by default, or be redirected by launchd.
+	// If you want a log file for the agent, you'd add a similar config option here.
+	// For now, it logs to console, which launchd can redirect.
 
-	// Initialize GCS client
-	gcsClient, err := gcs.NewClient(ctx, cfg.GCSBucketName, cfg.GCPCredentialsPath)
+	log.Printf("Starting macvmorx-agent with NodeID: %s", cfg.NodeID)
+
+	agent, err := agent.NewAgent(cfg)
 	if err != nil {
-		log.Fatalf("Failed to initialize GCS client: %v", err)
+		log.Fatalf("Failed to initialize agent: %v", err)
 	}
 
-	// Initialize VM Manager
-	vmManager := vm.NewManager(cfg, gcsClient)
-
-	// Initialize Heartbeat Sender
-	heartbeatSender, err := heartbeat.NewSender(cfg, vmManager)
-	if err != nil {
-		log.Fatalf("Failed to initialize heartbeat sender: %v", err)
-	}
-	go heartbeatSender.StartSendingHeartbeats(ctx)
-
-	// Initialize API handlers for incoming orchestrator commands
-	apiHandlers := api.NewHandlers(vmManager)
-
-	// Initialize and start the agent's web server
-	agentServer := web.NewServer(cfg.AgentListenPort, apiHandlers, cfg)
-	agentServer.Start() // This will block
+	agent.StartAgent()
 }
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		log.Fatalf("Error executing agent command: %v", err)
+		log.Fatalf("Error executing command: %v", err)
 		os.Exit(1)
 	}
 }

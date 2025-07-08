@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,66 +13,69 @@ import (
 	"github.com/changty97/macvmagt/internal/imagemgr"
 	"github.com/changty97/macvmagt/internal/models"
 	"github.com/changty97/macvmagt/internal/vmgr"
-	"github.com/gorilla/mux"
 )
 
-// Agent represents the MacVMOrx agent running on a Mac Mini.
+// Agent is the main struct for the macvmorx agent.
 type Agent struct {
-	cfg             *config.Config
-	heartbeatSender *heartbeat.Sender
-	imageManager    *imagemgr.Manager
-	vmManager       *vmgr.Manager
+	cfg          *config.Config
+	vmManager    *vmgr.VMManager
+	imageManager *imagemgr.ImageManager
+	hbSender     *heartbeat.Sender
 }
 
-// NewAgent creates and initializes a new agent instance.
+// NewAgent creates and initializes a new Agent instance.
 func NewAgent(cfg *config.Config) (*Agent, error) {
-	imageManager, err := imagemgr.NewManager(cfg)
+	imageManager, err := imagemgr.NewImageManager(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize image manager: %w", err)
+		return nil, fmt.Errorf("failed to create image manager: %w", err)
 	}
 
-	vmManager := vmgr.NewManager(cfg, imageManager)
-	heartbeatSender := heartbeat.NewSender(cfg, imageManager, vmManager)
+	vmManager, err := vmgr.NewVMManager(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VM manager: %w", err)
+	}
+
+	hbSender := heartbeat.NewSender(cfg, vmManager, imageManager)
 
 	return &Agent{
-		cfg:             cfg,
-		heartbeatSender: heartbeatSender,
-		imageManager:    imageManager,
-		vmManager:       vmManager,
+		cfg:          cfg,
+		vmManager:    vmManager,
+		imageManager: imageManager,
+		hbSender:     hbSender,
 	}, nil
 }
 
-// Start runs the agent's main loop and API server.
-func (a *Agent) Start() {
-	log.Printf("Starting MacVMOrx Agent (NodeID: %s)", a.cfg.NodeID)
+// StartAgent starts the agent's services.
+func (a *Agent) StartAgent() {
+	// Start heartbeat sender in a goroutine
+	go a.hbSender.StartSendingHeartbeats()
 
-	// Start sending heartbeats in a goroutine
-	go a.heartbeatSender.StartSendingHeartbeats()
+	// Set up HTTP server for receiving commands from the orchestrator
+	http.HandleFunc("/provision-vm", a.handleProvisionVM)
+	http.HandleFunc("/delete-vm", a.handleDeleteVM)
 
-	// Start HTTP server for orchestrator commands (e.g., provision/delete VM)
-	router := mux.NewRouter()
-	router.HandleFunc("/provision-vm", a.handleProvisionVM).Methods("POST")
-	router.HandleFunc("/delete-vm", a.handleDeleteVM).Methods("POST")
-	// Add other agent-specific API endpoints if needed
-
-	addr := ":8081" // Agent listens on a different port than orchestrator
-	log.Printf("Agent command server starting on %s", addr)
+	addr := ":" + a.cfg.AgentPort
+	log.Printf("Agent listening for orchestrator commands on %s (HTTP enabled)", addr)
 
 	srv := &http.Server{
 		Addr:         addr,
-		Handler:      router,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 5 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Could not start agent command server: %v", err)
+		log.Fatalf("Agent server could not start: %v", err)
 	}
 }
 
 // handleProvisionVM handles requests from the orchestrator to provision a VM.
 func (a *Agent) handleProvisionVM(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var cmd models.VMProvisionCommand
 	if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
 		log.Printf("Error decoding provision VM command: %v", err)
@@ -79,23 +83,42 @@ func (a *Agent) handleProvisionVM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Run provisioning in a goroutine to not block the API handler
+	log.Printf("Received provision VM command for VMID: %s, Image: %s", cmd.VMID, cmd.ImageName)
+
+	// Get image path (downloads if not cached)
+	imagePath, err := a.imageManager.GetImagePath(cmd.ImageName)
+	if err != nil {
+		log.Printf("Failed to get image path for '%s': %v", cmd.ImageName, err)
+		http.Error(w, fmt.Sprintf("Failed to prepare VM image: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Provision the VM in a goroutine to not block the HTTP response
 	go func() {
-		if err := a.vmManager.ProvisionVM(cmd); err != nil {
-			log.Printf("Failed to provision VM %s: %v", cmd.VMID, err)
-			// TODO: Report provisioning failure back to orchestrator
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute) // Allow ample time for VM provisioning
+		defer cancel()
+
+		vmInfo, provisionErr := a.vmManager.ProvisionVM(ctx, cmd, imagePath)
+		if provisionErr != nil {
+			log.Printf("Error provisioning VM '%s': %v", cmd.VMID, provisionErr)
+			// In a real system, you'd send a failure status back to the orchestrator
 		} else {
-			log.Printf("VM %s provisioning initiated successfully.", cmd.VMID)
-			// TODO: Report provisioning success back to orchestrator
+			log.Printf("VM '%s' provisioned successfully. IP: %s", vmInfo.VMID, vmInfo.VMIPAddress)
+			// In a real system, you'd send a success status back to the orchestrator
 		}
 	}()
 
-	w.WriteHeader(http.StatusAccepted) // Acknowledge receipt, provisioning happens in background
+	w.WriteHeader(http.StatusAccepted) // Acknowledge the command, provisioning happens asynchronously
 	json.NewEncoder(w).Encode(map[string]string{"message": "VM provisioning initiated"})
 }
 
 // handleDeleteVM handles requests from the orchestrator to delete a VM.
 func (a *Agent) handleDeleteVM(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var cmd models.VMDeleteCommand
 	if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
 		log.Printf("Error decoding delete VM command: %v", err)
@@ -103,17 +126,23 @@ func (a *Agent) handleDeleteVM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Run deletion in a goroutine
+	log.Printf("Received delete VM command for VMID: %s", cmd.VMID)
+
+	// Delete the VM in a goroutine to not block the HTTP response
 	go func() {
-		if err := a.vmManager.DeleteVM(cmd); err != nil {
-			log.Printf("Failed to delete VM %s: %v", cmd.VMID, err)
-			// TODO: Report deletion failure back to orchestrator
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute) // Allow time for VM deletion
+		defer cancel()
+
+		deleteErr := a.vmManager.DeleteVM(ctx, cmd)
+		if deleteErr != nil {
+			log.Printf("Error deleting VM '%s': %v", cmd.VMID, deleteErr)
+			// In a real system, you'd send a failure status back to the orchestrator
 		} else {
-			log.Printf("VM %s deletion initiated successfully.", cmd.VMID)
-			// TODO: Report deletion success back to orchestrator
+			log.Printf("VM '%s' deleted successfully.", cmd.VMID)
+			// In a real system, you'd send a success status back to the orchestrator
 		}
 	}()
 
-	w.WriteHeader(http.StatusAccepted) // Acknowledge receipt, deletion happens in background
+	w.WriteHeader(http.StatusAccepted) // Acknowledge the command, deletion happens asynchronously
 	json.NewEncoder(w).Encode(map[string]string{"message": "VM deletion initiated"})
 }

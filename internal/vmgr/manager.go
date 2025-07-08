@@ -1,143 +1,174 @@
 package vmgr
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/changty97/macvmagt/internal/config"
-	"github.com/changty97/macvmagt/internal/imagemgr"
 	"github.com/changty97/macvmagt/internal/models"
-	"github.com/changty97/macvmagt/internal/utils"
+	"github.com/changty97/macvmagt/internal/utils" // Corrected import path
 )
 
-// Manager handles VM creation, deletion, and status.
-type Manager struct {
-	cfg          *config.Config
-	imageManager *imagemgr.Manager
-	// Add a mutex if VM operations need to be synchronized
-	// activeVMs sync.Map // Map[string]*models.VMInfo if agent needs to track internal VM state
+// VMManager handles creating, deleting, and managing VM instances.
+type VMManager struct {
+	cfg        *config.Config
+	runningVMs sync.Map // map[vmID]*models.VMInfo
+	vmBasePath string   // Base path for VM data (e.g., /var/macvmorx/vms)
+	sshPort    string   // Default SSH port for VMs (tart typically uses 2222)
 }
 
-// NewManager creates a new VM Manager.
-func NewManager(cfg *config.Config, im *imagemgr.Manager) *Manager {
-	return &Manager{
-		cfg:          cfg,
-		imageManager: im,
-	}
-}
-
-// ProvisionVM handles the request to provision a new VM.
-// This is the core logic for spinning up a VM for a GitHub runner.
-func (m *Manager) ProvisionVM(cmd models.VMProvisionCommand) error {
-	log.Printf("Received request to provision VM %s with image %s", cmd.VMID, cmd.ImageName)
-
-	// 1. Check if image is cached and ready
-	imagePath, ok := m.imageManager.GetCachedImagePath(cmd.ImageName)
-	if !ok {
-		// Image not cached, request download
-		log.Printf("Image %s not cached. Requesting download.", cmd.ImageName)
-		m.imageManager.RequestImageDownload(cmd.ImageName)
-
-		// Wait for download to complete (non-blocking for agent, but blocking for this VM provisioning call)
-		// This is where the "queue/wait the current GitHub job" logic comes in.
-		// The orchestrator would have already decided this node is suitable for download.
-		// Here, we block THIS VM provisioning request until download is done.
-		timeout := time.After(30 * time.Minute) // Max wait time for download
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				imagePath, ok = m.imageManager.GetCachedImagePath(cmd.ImageName)
-				if ok && !m.imageManager.IsImageDownloading(cmd.ImageName) {
-					log.Printf("Image %s downloaded. Proceeding with VM provisioning.", cmd.ImageName)
-					goto ImageReady // Break out of loop and continue
-				}
-				log.Printf("Waiting for image %s to finish downloading...", cmd.ImageName)
-			case <-timeout:
-				return fmt.Errorf("timeout waiting for image %s to download for VM %s", cmd.ImageName, cmd.VMID)
-			}
-		}
-	ImageReady: // Label to jump to after successful download
-		if imagePath == "" {
-			return fmt.Errorf("image %s path is empty after download, cannot provision VM %s", cmd.ImageName, cmd.VMID)
-		}
-	}
-
-	// 2. Create and Start the VM
-	// This is where you call macOS `vm` commands or interact with Hypervisor.framework.
-	// For ephemeral runners, you'd want to clone the base image to a new location for the VM.
-	vmBasePath := fmt.Sprintf("/var/macvmorx/vms/%s", cmd.VMID)
+// NewVMManager creates and initializes a new VMManager.
+func NewVMManager(cfg *config.Config) (*VMManager, error) {
+	vmBasePath := "/var/macvmorx/vms" // Default for tart VMs
 	if err := os.MkdirAll(vmBasePath, 0755); err != nil {
-		return fmt.Errorf("failed to create VM base directory %s: %w", vmBasePath, err)
+		return nil, fmt.Errorf("failed to create VM base directory %s: %w", vmBasePath, err)
 	}
 
-	// Example: Copy the base image to the VM's directory
-	vmDiskPath := filepath.Join(vmBasePath, fmt.Sprintf("%s.sparseimage", cmd.VMID))
-	log.Printf("Cloning image %s to %s for VM %s...", imagePath, vmDiskPath, cmd.VMID)
-	_, err := utils.ExecuteCommand("cp", imagePath, vmDiskPath) // Simple copy, consider `hdiutil compact` for sparse images
+	return &VMManager{
+		cfg:        cfg,
+		vmBasePath: vmBasePath,
+		sshPort:    "2222", // Tart's default SSH port
+	}, nil
+}
+
+// ProvisionVM creates a new VM, installs the GitHub runner, and starts it.
+func (vmm *VMManager) ProvisionVM(ctx context.Context, cmd models.VMProvisionCommand, imagePath string) (*models.VMInfo, error) {
+	vmID := cmd.VMID
+	runnerName := cmd.RunnerName
+	runnerRegistrationToken := cmd.RunnerRegistrationToken
+	runnerLabels := strings.Join(cmd.RunnerLabels, ",") // Labels are joined into a single string
+
+	log.Printf("Provisioning VM '%s' from image '%s'...", vmID, imagePath)
+
+	// 1. Check if VM already exists (e.g., if a previous attempt failed mid-way)
+	_, err := os.Stat(filepath.Join(vmm.vmBasePath, vmID))
+	if err == nil {
+		log.Printf("VM directory for '%s' already exists. Attempting to delete and recreate.", vmID)
+		if _, _, delErr := utils.RunCommand("tart", "delete", vmID); delErr != nil {
+			log.Printf("Warning: Failed to delete existing VM '%s': %v", vmID, delErr)
+			// Proceeding might lead to issues, but for robustness, we try to recreate.
+		}
+	}
+
+	// 2. Create the VM using `tart create`
+	log.Printf("Running tart create for VM '%s' from image '%s'...", vmID, imagePath)
+	stdout, stderr, err := utils.RunCommand("tart", "create", "--dir", vmm.vmBasePath, vmID, "--from", imagePath)
 	if err != nil {
-		return fmt.Errorf("failed to clone VM disk image: %w", err)
+		return nil, fmt.Errorf("failed to create VM '%s' with tart: %w, stdout: %s, stderr: %s", vmID, err, stdout, stderr)
 	}
-	log.Printf("Image cloned for VM %s.", cmd.VMID)
+	log.Printf("Tart create output for VM '%s':\nStdout: %s\nStderr: %s", vmID, stdout, stderr)
 
-	// Actual VM creation using `vm` command (highly simplified example)
-	// This assumes `vm` can create a VM from a disk image directly.
-	// For a more robust solution, consider `tart` (https://github.com/cirruslabs/tart)
-	// or direct Hypervisor.framework interaction in Swift.
-	// Example `vm` command for creating a VM:
-	// `vm create --name <VMID> --disk <vmDiskPath> --memory 4G --cpu 2`
-	// You'd need to configure networking (e.g., bridged, NAT) and other VM parameters.
-	// For simplicity, we'll just simulate the creation.
-	log.Printf("Placeholder: Executing VM creation command for %s using disk %s...", cmd.VMID, vmDiskPath)
-	// Simulate VM creation time
-	time.Sleep(10 * time.Second) // Simulate actual VM creation/boot time
+	// 3. Start the VM using `tart run` in background
+	log.Printf("Running tart run for VM '%s' in background...", vmID)
+	// Execute tart run in a separate command that is detached.
+	cmdRun := exec.Command("nohup", "tart", "run", vmID, "&>/dev/null &")
+	err = cmdRun.Start()
+	if err != nil {
+		return nil, fmt.Errorf("failed to start VM '%s' with tart run (nohup): %w", vmID, err)
+	}
+	log.Printf("VM '%s' started with tart run (PID: %d).", vmID, cmdRun.Process.Pid)
 
-	// Start the VM
-	// `vm start <VMID>`
-	log.Printf("Placeholder: VM %s started.", cmd.VMID)
+	// 4. Get VM IP Address and wait for SSH
+	var vmIP string
+	maxAttempts := 30 // Try for up to 30 * 2 seconds = 1 minute
+	for i := 0; i < maxAttempts; i++ {
+		vmIP, err = utils.GetVMIPAddress(vmID)
+		if err == nil && vmIP != "" {
+			log.Printf("Discovered VM IP for '%s': %s", vmID, vmIP)
+			break
+		}
+		log.Printf("Waiting for VM '%s' IP address... Attempt %d/%d", vmID, i+1, maxAttempts)
+		time.Sleep(2 * time.Second) // Wait before retrying
+	}
+	if vmIP == "" {
+		return nil, fmt.Errorf("failed to get IP address for VM '%s' after multiple attempts: %w", vmID, err)
+	}
 
-	// 3. Run Post-Script to Install GitHub Runner
-	// This script should be located on the Mac Mini agent.
-	// It needs to be executed *inside* the newly created VM. This is complex
-	// and typically involves SSH or a shared folder mechanism.
-	// For now, we'll simulate it.
-	// runnerScriptPath := "github.com/changty97/macvmagt/scripts/install_github_runner.sh.template" // Adjust path
-	uniqueRunnerName := fmt.Sprintf("macvmorx-runner-%s-%s", m.cfg.NodeID, cmd.VMID)
+	// Wait for SSH to be ready on the VM
+	err = utils.WaitForSSHReady(vmIP, vmm.sshPort, vmm.cfg.VMSSHUser, vmm.cfg.VMSSHKeyPath, 5*time.Minute)
+	if err != nil {
+		return nil, fmt.Errorf("SSH not ready on VM '%s' (%s): %w", vmID, vmIP, err)
+	}
 
-	log.Printf("Placeholder: Running post-script to install GitHub runner '%s' on VM %s...", uniqueRunnerName, cmd.VMID)
-	// Example: Execute a script via SSH into the VM (requires SSH server in VM and credentials)
-	// `ssh user@<VM_IP_ADDRESS> "bash -s" < ${runnerScriptPath} ${uniqueRunnerName}`
-	// Or use a shared folder and execute locally within the VM.
-	time.Sleep(5 * time.Second) // Simulate runner installation
-	log.Printf("Placeholder: GitHub runner '%s' installed on VM %s.", uniqueRunnerName, cmd.VMID)
+	// 5. Execute post-provisioning script (GitHub Runner installation)
+	log.Printf("Executing GitHub runner installation script on VM '%s' (%s)...", vmID, vmIP)
+	runnerScriptContent, err := os.ReadFile(vmm.cfg.GitHubRunnerScriptPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read GitHub runner script template: %w", err)
+	}
 
-	log.Printf("VM %s provisioned and ready for GitHub job.", cmd.VMID)
+	// Replace placeholders in the script template
+	script := string(runnerScriptContent)
+	// These placeholders in the script template will be replaced by the agent
+	// before sending the script to the VM.
+	// You should configure these values in your agent's environment or config.
+	script = strings.ReplaceAll(script, "YOUR_GITHUB_ORG_OR_USER_ACTUAL", "your-github-org-or-user") // Placeholder
+	script = strings.ReplaceAll(script, "YOUR_GITHUB_REPO_ACTUAL", "your-github-repo")               // Placeholder
+	script = strings.ReplaceAll(script, "YOUR_GITHUB_RUNNER_REGISTRATION_TOKEN", runnerRegistrationToken)
+
+	// Send the script to the VM and execute it, passing runnerName and runnerLabels as arguments
+	// The `bash -s --` syntax is crucial to correctly pass arguments to the script read from stdin.
+	sshCommand := fmt.Sprintf("bash -s -- '%s' '%s' <<'EOF'\n%s\nEOF", runnerName, runnerLabels, script)
+	sshStdout, sshStderr, err := utils.ExecuteSSHCommand(vmIP, vmm.sshPort, vmm.cfg.VMSSHUser, vmm.cfg.VMSSHKeyPath, sshCommand)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute GitHub runner script on VM '%s' (%s): %w, stdout: %s, stderr: %s",
+			vmID, vmIP, err, sshStdout, sshStderr)
+	}
+	log.Printf("GitHub runner script executed successfully on VM '%s'. Stdout: %s", vmID, sshStdout)
+
+	now := time.Now()
+	vmInfo := &models.VMInfo{
+		VMID:        vmID,
+		ImageName:   cmd.ImageName,
+		VMHostname:  vmID, // Assuming VMID acts as hostname for now
+		VMIPAddress: vmIP,
+		VMStartTime: &now, // Set the VM start time
+		// RuntimeSeconds will be calculated by heartbeat sender
+	}
+	vmm.runningVMs.Store(vmID, vmInfo)
+	log.Printf("VM '%s' provisioned and GitHub runner configured.", vmID)
+
+	return vmInfo, nil
+}
+
+// DeleteVM stops and deletes a VM.
+func (vmm *VMManager) DeleteVM(ctx context.Context, cmd models.VMDeleteCommand) error {
+	vmID := cmd.VMID
+	log.Printf("Deleting VM '%s'...", vmID)
+
+	// 1. Stop the VM (if running) and delete using `tart delete`
+	// `tart delete` handles stopping the VM process associated with the VMID.
+	stdout, stderr, err := utils.RunCommand("tart", "delete", vmID)
+	if err != nil {
+		return fmt.Errorf("failed to delete VM '%s' with tart: %w, stdout: %s, stderr: %s", vmID, err, stdout, stderr)
+	}
+	log.Printf("Tart delete output for VM '%s':\nStdout: %s\nStderr: %s", vmID, stdout, stderr)
+
+	vmm.runningVMs.Delete(vmID)
+	log.Printf("VM '%s' deleted successfully.", vmID)
 	return nil
 }
 
-// DeleteVM handles the request to delete a VM.
-func (m *Manager) DeleteVM(cmd models.VMDeleteCommand) error {
-	log.Printf("Received request to delete VM %s", cmd.VMID)
-
-	// 1. Stop and Delete the VM
-	// This calls the vmutils.DeleteVM which uses the `vm` command.
-	err := utils.DeleteVM(cmd.VMID)
-	if err != nil {
-		return fmt.Errorf("failed to delete VM %s: %w", cmd.VMID, err)
-	}
-
-	// 2. Clean up VM's disk image and directory
-	vmBasePath := fmt.Sprintf("/var/macvmorx/vms/%s", cmd.VMID)
-	log.Printf("Cleaning up VM directory: %s", vmBasePath)
-	if err := os.RemoveAll(vmBasePath); err != nil {
-		log.Printf("Warning: Failed to remove VM directory %s: %v", vmBasePath, err)
-	}
-
-	log.Printf("VM %s deleted and cleaned up.", cmd.VMID)
-	return nil
+// GetRunningVMs returns a list of currently running VMs.
+func (vmm *VMManager) GetRunningVMs() []models.VMInfo {
+	var vms []models.VMInfo
+	vmm.runningVMs.Range(func(key, value interface{}) bool {
+		vm := value.(*models.VMInfo)
+		// Calculate runtime for reporting in heartbeat
+		if vm.VMStartTime != nil {
+			vm.RuntimeSeconds = int64(time.Since(*vm.VMStartTime).Seconds())
+		} else {
+			vm.RuntimeSeconds = 0 // Or some other default if start time is unknown
+		}
+		vms = append(vms, *vm)
+		return true
+	})
+	return vms
 }

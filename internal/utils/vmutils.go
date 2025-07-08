@@ -2,102 +2,143 @@
 package utils
 
 import (
-	"encoding/json" // For parsing tart list output
+	// For parsing tart list output
+	"bytes"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"net"
 	"strings"
 	"time"
 
-	"github.com/changty97/macvmagt/internal/models"
+	"golang.org/x/crypto/ssh"
 )
 
-// TartVMInfo represents a simplified structure for parsing `tart list --json` output.
-// Adjust fields based on actual `tart` output.
-type TartVMInfo struct {
-	Name   string `json:"name"`
-	State  string `json:"state"`
-	IP     string `json:"ip"`
-	Uptime int64  `json:"uptime"` // Uptime in seconds
-	// Tart does not directly expose the base image name in `list --json` output.
-	// You might need to track this internally in your vmgr.Manager or imagemgr.Manager.
-	// For now, we'll set it to "unknown" or derive it if possible.
-}
-
-// GetRunningVMs uses `tart list --json` to get details of running VMs.
-func GetRunningVMs() ([]models.VMInfo, error) {
-	output, err := ExecuteCommand("tart", "list", "--format", "json")
+// GetVMIPAddress attempts to get the IP address of a running Tart VM.
+// This is a simplified example. In a real scenario, you might need to
+// parse `tart list --json` output or use Bonjour/mDNS.
+func GetVMIPAddress(vmID string) (string, error) {
+	// For tart, typically the VM gets an IP on the 'bridge' network.
+	// You might need to query `tart list` and parse its JSON output
+	// to find the assigned IP. This is a placeholder.
+	// Example: `tart list --json` and look for NetworkInterfaces[0].IPAddress
+	stdout, stderr, err := RunCommand("tart", "list", "--json")
 	if err != nil {
-		// Tart list might return an error if no VMs, or empty JSON array
-		if strings.Contains(err.Error(), "no VMs found") || strings.TrimSpace(output) == "[]" || strings.Contains(err.Error(), "exit status 1") {
-			return []models.VMInfo{}, nil
-		}
-		return nil, fmt.Errorf("failed to list VMs with tart: %w", err)
+		return "", fmt.Errorf("failed to list tart VMs: %v, stderr: %s", err, stderr)
 	}
 
-	var tartVMs []TartVMInfo
-	if err := json.Unmarshal([]byte(output), &tartVMs); err != nil {
-		return nil, fmt.Errorf("failed to parse tart list JSON output: %w", err)
-	}
-
-	var vms []models.VMInfo
-	for _, tvm := range tartVMs {
-		if tvm.State == "Running" {
-			vms = append(vms, models.VMInfo{
-				VMID:           tvm.Name,
-				ImageName:      "unknown", // Tart doesn't directly expose base image name in `list --json`.
-				RuntimeSeconds: tvm.Uptime,
-				VMHostname:     "unknown", // Tart doesn't directly expose hostname. May need SSH to get it.
-				VMIPAddress:    tvm.IP,
-			})
+	// This is a simplified JSON parsing. For robust parsing, use encoding/json
+	// and unmarshal into a struct matching tart's output.
+	// Assuming a simple output where IP is easily extractable for the given VMID.
+	// A more robust solution would involve unmarshaling the JSON output.
+	// For now, let's simulate by looking for a pattern.
+	// This is a very fragile parsing, a real implementation needs proper JSON unmarshaling.
+	lines := strings.Split(stdout, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, vmID) && strings.Contains(line, "IPAddress") {
+			// This is a naive attempt; proper JSON parsing is required.
+			// Example: "IPAddress": "192.168.64.2"
+			if ipIndex := strings.Index(line, `"IPAddress": "`); ipIndex != -1 {
+				ipStart := ipIndex + len(`"IPAddress": "`)
+				ipEnd := strings.Index(line[ipStart:], `"`)
+				if ipEnd != -1 {
+					ip := line[ipStart : ipStart+ipEnd]
+					log.Printf("Found VM IP for %s: %s", vmID, ip)
+					return ip, nil
+				}
+			}
 		}
 	}
-	return vms, nil
+
+	return "", fmt.Errorf("VM IP address not found for VMID: %s", vmID)
 }
 
-// CreateVM creates a new virtual machine using the specified image via `tart`.
-// Assumes `imageName` corresponds to a base image known to tart (e.g., `tart pull` has been run).
-// `imagePath` is no longer directly used for cloning, but `imageName` is the key for tart.
-func CreateVM(vmID, imageName string) error {
-	log.Printf("Creating VM %s from tart base image %s...", vmID, imageName)
+// WaitForSSHReady waits for the SSH server in the VM to be ready.
+func WaitForSSHReady(ip string, port string, user string, keyPath string, timeout time.Duration) error {
+	addr := net.JoinHostPort(ip, port)
+	log.Printf("Waiting for SSH on %s...", addr)
 
-	// Clone the base image to create a new VM instance.
-	// This command creates a new VM based on an existing base image.
-	// You might need to add more arguments for CPU, memory, disk size, etc.
-	// Example: tart clone <base_image_name> <new_vm_name> --cpu 2 --memory 4GB --disk 50GB
-	_, err := ExecuteCommand("tart", "clone", imageName, vmID)
+	signer, err := getSSHSigner(keyPath)
 	if err != nil {
-		return fmt.Errorf("failed to clone VM %s from image %s using tart: %w", vmID, imageName, err)
+		return fmt.Errorf("failed to get SSH signer: %w", err)
 	}
-	log.Printf("VM %s cloned from image %s.", vmID, imageName)
 
-	// Start the VM.
-	// This command runs the cloned VM.
-	_, err = ExecuteCommand("tart", "run", vmID)
-	if err != nil {
-		return fmt.Errorf("failed to start VM %s using tart: %w", vmID, err)
+	config := &ssh.ClientConfig{
+		User: user,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(signer),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // WARNING: Insecure for production, use ssh.FixedHostKey or known_hosts
+		Timeout:         5 * time.Second,             // Timeout for individual dial attempts
 	}
-	log.Printf("VM %s started.", vmID)
 
-	// Simulate VM creation/boot time if needed for testing, otherwise remove.
-	time.Sleep(10 * time.Second)
-
-	return nil
+	startTime := time.Now()
+	for time.Since(startTime) < timeout {
+		client, err := ssh.Dial("tcp", addr, config)
+		if err == nil {
+			client.Close()
+			log.Printf("SSH on %s is ready.", addr)
+			return nil
+		}
+		log.Printf("SSH not ready on %s: %v. Retrying...", addr, err)
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("SSH not ready on %s after %s timeout", addr, timeout)
 }
 
-// DeleteVM stops and deletes a virtual machine using `tart`.
-func DeleteVM(vmID string) error {
-	log.Printf("Deleting VM %s using tart...", vmID)
-	// Stop the VM first (tart stop is idempotent, won't error if not running)
-	_, err := ExecuteCommand("tart", "stop", vmID)
+// ExecuteSSHCommand executes a command over SSH on the VM.
+func ExecuteSSHCommand(ip string, port string, user string, keyPath string, command string) (string, string, error) {
+	addr := net.JoinHostPort(ip, port)
+	log.Printf("Executing SSH command on %s: %s", addr, command)
+
+	signer, err := getSSHSigner(keyPath)
 	if err != nil {
-		log.Printf("Warning: Failed to stop VM %s (might not be running or other error): %v", vmID, err)
+		return "", "", fmt.Errorf("failed to get SSH signer: %w", err)
 	}
 
-	// Delete the VM
-	_, err = ExecuteCommand("tart", "delete", vmID)
-	if err != nil {
-		return fmt.Errorf("failed to delete VM %s using tart: %w", vmID, err)
+	config := &ssh.ClientConfig{
+		User: user,
+		Auth: []ssh.AuthMethod{
+			ssh.PublicKeys(signer),
+		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // WARNING: Insecure for production
+		Timeout:         10 * time.Second,
 	}
-	log.Printf("VM %s deleted successfully.", vmID)
-	return nil
+
+	client, err := ssh.Dial("tcp", addr, config)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to dial SSH: %w", err)
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	session.Stdout = &stdoutBuf
+	session.Stderr = &stderrBuf
+
+	err = session.Run(command)
+	if err != nil {
+		return stdoutBuf.String(), stderrBuf.String(), fmt.Errorf("SSH command failed: %w, stdout: %s, stderr: %s", err, stdoutBuf.String(), stderrBuf.String())
+	}
+	log.Printf("SSH command success. Stdout: %s", stdoutBuf.String())
+	return stdoutBuf.String(), stderrBuf.String(), nil
+}
+
+// getSSHSigner loads the private key for SSH authentication.
+func getSSHSigner(keyPath string) (ssh.Signer, error) {
+	key, err := ioutil.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read private key: %w", err)
+	}
+
+	signer, err := ssh.ParsePrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse private key: %w", err)
+	}
+	return signer, nil
 }

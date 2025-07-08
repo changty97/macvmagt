@@ -102,13 +102,13 @@ func (m *Manager) ProvisionVM(ctx context.Context, cmd models.VMProvisionCommand
 	}
 
 	// 1. Clone the image
-	log.Printf("Cloning image %s to VM %s...", cmd.ImageName, cmd.VMID)
-	cloneCmd := exec.Command("tart", "clone", cmd.ImageName, cmd.VMID)
-	cloneCmd.Dir = m.cfg.ImageCacheDir // tart expects to clone from its working directory
-	if output, err := cloneCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to clone image %s to %s: %w\nOutput: %s", cmd.ImageName, cmd.VMID, err, output)
-	}
-	log.Printf("Image %s cloned to VM %s successfully.", cmd.ImageName, cmd.VMID)
+	// log.Printf("Cloning image %s to VM %s...", cmd.ImageName, cmd.VMID)
+	// cloneCmd := exec.Command("tart", "clone", cmd.ImageName, cmd.VMID)
+	// cloneCmd.Dir = m.cfg.ImageCacheDir // tart expects to clone from its working directory
+	// if output, err := cloneCmd.CombinedOutput(); err != nil {
+	// 	return fmt.Errorf("failed to clone image %s to %s: %w\nOutput: %s", cmd.ImageName, cmd.VMID, err, output)
+	// }
+	// log.Printf("Image %s cloned to VM %s successfully.", cmd.ImageName, cmd.VMID)
 
 	// 2. Start the VM
 	log.Printf("Starting VM %s...", cmd.VMID)

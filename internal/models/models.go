@@ -1,12 +1,15 @@
 package models
 
+import "time"
+
 // VMInfo represents details about a single VM running on a Mac Mini.
 type VMInfo struct {
-	VMID           string `json:"vmId"`           // Unique ID of the VM
-	ImageName      string `json:"imageName"`      // Name of the image used for this VM
-	RuntimeSeconds int64  `json:"runtimeSeconds"` // How long the VM has been running in seconds
-	VMHostname     string `json:"vmHostname"`     // Hostname of the VM
-	VMIPAddress    string `json:"vmIpAddress"`    // IP address of the VM
+	VMID           string     `json:"vmId"`                  // Unique ID of the VM
+	ImageName      string     `json:"imageName"`             // Name of the image used for this VM
+	RuntimeSeconds int64      `json:"runtimeSeconds"`        // How long the VM has been running in seconds
+	VMHostname     string     `json:"vmHostname"`            // Hostname of the VM
+	VMIPAddress    string     `json:"vmIpAddress"`           // IP address of the VM
+	VMStartTime    *time.Time `json:"vmStartTime,omitempty"` // When the VM actually started running
 }
 
 // HeartbeatPayload represents the data sent by a Mac Mini in its heartbeat.
