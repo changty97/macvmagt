@@ -5,6 +5,7 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // RunCommand executes a shell command and returns its stdout, stderr, and an error.
@@ -16,6 +17,7 @@ func RunCommand(name string, arg ...string) (string, string, error) {
 
 	log.Printf("Executing command: %s %s", name, strings.Join(arg, " "))
 	err := cmd.Run()
+	time.Sleep(60 * time.Second)
 	if err != nil {
 		log.Printf("Command failed: %s %s, Error: %v, Stdout: %s, Stderr: %s", name, strings.Join(arg, " "), err, stdout.String(), stderr.String())
 	} else {

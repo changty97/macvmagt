@@ -8,7 +8,7 @@ import (
 	"time" // Added for context.WithTimeout
 
 	"github.com/changty97/macvmagt/internal/models"
-	"github.com/changty97/macvmagt/internal/vm"
+	"github.com/changty97/macvmagt/internal/vmgr"
 )
 
 // Handlers struct holds dependencies for API handlers.

@@ -59,7 +59,7 @@ func (vmm *VMManager) ProvisionVM(ctx context.Context, cmd models.VMProvisionCom
 
 	// 2. Create the VM using `tart create`
 	log.Printf("Running tart create for VM '%s' from image '%s'...", vmID, imagePath)
-	stdout, stderr, err := utils.RunCommand("tart", "create", "--dir", vmm.vmBasePath, vmID, "--from", imagePath)
+	stdout, stderr, err := utils.RunCommand("tart", "create", vmID, "--from-ipsw", imagePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create VM '%s' with tart: %w, stdout: %s, stderr: %s", vmID, err, stdout, stderr)
 	}
