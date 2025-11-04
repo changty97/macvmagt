@@ -29,14 +29,49 @@ const (
 	VMRootDirEnv  = "VM_ROOT_DIR"     // e.g., /Users/arc-user/runners
 	ImageCacheEnv = "IMAGE_CACHE_DIR" // e.g., /Users/arc-user/macosv_vm_base_images
 
-	MaxActiveVMs = 1 // Enforce the limit of only one active VM per Mac Mini
+	MaxActiveVMs = 2 // Enforce the limit of only one active VM per Mac Mini
 )
 
 var (
 	vmRootDir     string
 	imageCacheDir string
 	mutex         sync.Mutex // Mutex to protect concurrent access to the VM directory check/creation
+	nodeHostname  string     // Global variable to store the system's hostname/domain ID
 )
+
+// --- CONFIGURATION STRUCTS (Replacing VM_CONFIG_JSON_TEMPLATE) ---
+
+// StorageDevice mirrors the objects in the "storage" array in config.json
+type StorageDevice struct {
+	Type     string `json:"type"`
+	File     string `json:"file"` // This will now hold the ABSOLUTE path
+	ReadOnly bool   `json:"readOnly"`
+}
+
+// DisplayConfig mirrors the objects in the "displays" array in config.json
+type DisplayConfig struct {
+	DPI    int `json:"dpi"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+// NetworkConfig mirrors the objects in the "networks" array in config.json
+type NetworkConfig struct {
+	Type string `json:"type"`
+}
+
+// VMConfig is the primary structure for the VM's config.json
+type VMConfig struct {
+	HardwareModel string          `json:"hardwareModel"`
+	Storage       []StorageDevice `json:"storage"`
+	RAM           uint64          `json:"ram"`
+	MachineID     string          `json:"machineId"`
+	Displays      []DisplayConfig `json:"displays"`
+	Version       int             `json:"version"`
+	CPUs          int             `json:"cpus"`
+	Networks      []NetworkConfig `json:"networks"`
+	Audio         bool            `json:"audio"`
+}
 
 // --- DATA STRUCTURES ---
 
@@ -63,23 +98,32 @@ type DeleteVMRequest struct {
 	VMID string `json:"vmId"`
 }
 
-// --- MACHINE IDENTIFIER GENERATION (Refactored from user input) ---
+// vmPaths aggregates all relevant file paths for a VM.
+type vmPaths struct {
+	vmRootPath          string
+	imageName           string
+	vmDiskDestPath      string
+	vmAuxDestPath       string
+	vmConfigPath        string
+	vmLogPath           string
+	vmPIDPath           string
+	imageDiskSourcePath string
+	imageAuxSourcePath  string
+}
 
-// generateMachineIdentifier generates a random unique ECID and returns it as a base64-encoded
-// binary plist, ready for injection into the VM configuration.
+// --- MACHINE IDENTIFIER GENERATION ---
+
+// generateMachineIdentifier generates a random unique ECID (Base64-encoded binary plist).
 func generateMachineIdentifier() (string, error) {
 	// 1. Generate a random 64-bit integer
-	// The range is [1, 2**63 - 1]. MaxInt64 is 2**63 - 1.
-	upperBoundForRandInt := big.NewInt(0).Sub(big.NewInt(math.MaxInt64), big.NewInt(1)) // 2**63 - 2
-
+	upperBoundForRandInt := big.NewInt(0).Sub(big.NewInt(math.MaxInt64), big.NewInt(1))
 	randomBigInt, err := crand.Int(crand.Reader, upperBoundForRandInt)
 	if err != nil {
 		return "", fmt.Errorf("error generating random number: %w", err)
 	}
-	// Shift range from [0, 2**63 - 3] to [1, 2**63 - 2]
 	randomECID := randomBigInt.Uint64() + 1
 
-	// 2. Create the XML plist content with the generated ECID
+	// 2. Create the XML plist content
 	plistTemplate := `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -135,8 +179,42 @@ func generateMachineIdentifier() (string, error) {
 
 // --- HELPER FUNCTIONS ---
 
-// checkConfig ensures all necessary environment variables are set.
+// getVMPaths calculates all necessary file paths for a given VM ID and Image Name.
+func getVMPaths(vmID, imageName string) vmPaths {
+	vmPath := filepath.Join(vmRootDir, "vm_"+vmID)
+
+	// Default paths for source images.
+	imageDiskSourcePath := ""
+	imageAuxSourcePath := ""
+	if imageName != "" {
+		imageDiskSourcePath = filepath.Join(imageCacheDir, imageName, "base.img")
+		imageAuxSourcePath = filepath.Join(imageCacheDir, imageName, "aux.img")
+	}
+
+	return vmPaths{
+		vmRootPath: vmPath,
+		imageName:  imageName,
+		// Full, absolute paths for disk files (requested change)
+		vmDiskDestPath:      filepath.Join(vmPath, "disk.img"),
+		vmAuxDestPath:       filepath.Join(vmPath, "aux.img"),
+		vmConfigPath:        filepath.Join(vmPath, "config.json"),
+		vmLogPath:           filepath.Join(vmPath, "vm.log"),
+		vmPIDPath:           filepath.Join(vmPath, "vm.pid"),
+		imageDiskSourcePath: imageDiskSourcePath,
+		imageAuxSourcePath:  imageAuxSourcePath,
+	}
+}
+
+// checkConfig ensures all necessary environment variables are set and retrieves the system hostname.
 func checkConfig() error {
+	var err error
+
+	// Get the system's hostname for the NodeID
+	nodeHostname, err = os.Hostname()
+	if err != nil {
+		return fmt.Errorf("failed to get system hostname (Node ID): %w", err)
+	}
+
 	vmRootDir = os.Getenv(VMRootDirEnv)
 	imageCacheDir = os.Getenv(ImageCacheEnv)
 
@@ -155,7 +233,7 @@ func checkConfig() error {
 		}
 	}
 
-	log.Printf("Config loaded: VM Root Dir=%s, Image Cache Dir=%s", vmRootDir, imageCacheDir)
+	log.Printf("Config loaded: VM Root Dir=%s, Image Cache Dir=%s, Node ID=%s", vmRootDir, imageCacheDir, nodeHostname)
 	return nil
 }
 
@@ -179,36 +257,75 @@ func getActiveVMs() ([]string, error) {
 	return activeVMs, nil
 }
 
-// runCommand executes a shell command and logs its output.
-func runCommand(name string, args ...string) error {
-	log.Printf("Executing command: %s %v", name, args)
-	cmd := exec.Command(name, args...)
+// copyFile copies a file from src to dst.
+func copyFile(src, dst string) (int64, error) {
+	sourceFileStat, err := os.Stat(src)
+	if err != nil {
+		return 0, fmt.Errorf("source file stat error: %w", err)
+	}
 
-	// Create pipes for combined output (stdout and stderr)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to set up stdout pipe: %w", err)
+	if !sourceFileStat.Mode().IsRegular() {
+		return 0, fmt.Errorf("source is not a regular file: %s", src)
 	}
-	stderr, err := cmd.StderrPipe()
+
+	source, err := os.Open(src)
 	if err != nil {
-		return fmt.Errorf("failed to set up stderr pipe: %w", err)
+		return 0, fmt.Errorf("error opening source file: %w", err)
 	}
+	defer source.Close()
+
+	destination, err := os.Create(dst)
+	if err != nil {
+		return 0, fmt.Errorf("error creating destination file: %w", err)
+	}
+	defer destination.Close()
+
+	nBytes, err := io.Copy(destination, source)
+	if err != nil {
+		return 0, fmt.Errorf("error copying file: %w", err)
+	}
+
+	return nBytes, nil
+}
+
+// startVMInBackground launches the VM process non-blocking and records its PID and output.
+func startVMInBackground(vmID string, paths vmPaths) error {
+	logFile, err := os.Create(paths.vmLogPath)
+	if err != nil {
+		return fmt.Errorf("failed to create log file: %w", err)
+	}
+
+	log.Printf("Executing command: macosvm -g %s", paths.vmConfigPath)
+
+	cmd := exec.Command("macosvm", "-g", paths.vmConfigPath)
+
+	// Redirect Stdout and Stderr to the log file
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("command failed to start: %w", err)
+		logFile.Close() // Close file if start fails immediately
+		return fmt.Errorf("failed to start macosvm: %w", err)
 	}
 
-	// Read and log output in real-time
-	combinedOutput := io.MultiReader(stdout, stderr)
+	// 1. Capture and write the PID
+	pid := cmd.Process.Pid
+	if err := os.WriteFile(paths.vmPIDPath, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
+		log.Printf("CRITICAL: Failed to write PID file for %s: %v. VM may be running without trackable PID.", vmID, err)
+	} else {
+		log.Printf("VM %s started in background with PID %d. PID file: %s", vmID, pid, paths.vmPIDPath)
+	}
+
+	// 2. Monitor the process exit in a non-blocking goroutine
 	go func() {
-		// Copy to discard after logging to os.Stdout
-		io.Copy(io.Discard, io.TeeReader(combinedOutput, os.Stdout))
+		if err := cmd.Wait(); err != nil {
+			log.Printf("VM %s (PID %d) process finished with error: %v. VM files still exist.", vmID, pid, err)
+		} else {
+			log.Printf("VM %s (PID %d) process exited normally. VM files still exist.", vmID, pid)
+		}
+		logFile.Close()
 	}()
 
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("command exited with error: %w", err)
-	}
-	log.Printf("Command completed successfully: %s", name)
 	return nil
 }
 
@@ -236,13 +353,13 @@ func handleVMs(w http.ResponseWriter, r *http.Request) {
 		AvailableVMs: availableSlots,
 		VMCount:      vmCount,
 		VMs:          activeVMs,
-		NodeID:       "macvm-node-id", // Placeholder
+		NodeID:       nodeHostname, // Use the dynamically retrieved hostname
 	}
 
 	json.NewEncoder(w).Encode(status)
 }
 
-// handleProvisionVM provisions a new VM only if a slot is available (VMCount < 1).
+// handleProvisionVM provisions a new VM by setting up files and running the process in the background.
 func handleProvisionVM(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -256,7 +373,6 @@ func handleProvisionVM(w http.ResponseWriter, r *http.Request) {
 	if len(activeVMs) >= MaxActiveVMs {
 		msg := fmt.Sprintf("Node is busy. %d active VM(s) found in %s. Max allowed is %d.", len(activeVMs), vmRootDir, MaxActiveVMs)
 		log.Println(msg)
-		// Return 429 Too Many Requests to signal the orchestrator to wait.
 		http.Error(w, msg, http.StatusTooManyRequests)
 		return
 	}
@@ -273,67 +389,98 @@ func handleProvisionVM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Generate Unique Machine ID
+	// 3. Generate Unique Machine ID (ECID)
 	machineID, err := generateMachineIdentifier()
 	if err != nil {
 		log.Printf("Failed to generate unique machine identifier: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to generate machine ID: %v", err), http.StatusInternalServerError)
 		return
 	}
-	log.Printf("Generated Machine Identifier for %s: %s (Base64)", req.VMID, machineID)
 
-	// 4. Dynamic Path Calculation
-	vmPath := filepath.Join(vmRootDir, "vm_"+req.VMID)
-	imagePath := filepath.Join(imageCacheDir, req.ImageName, "base.img")
+	// 4. Calculate Paths
+	paths := getVMPaths(req.VMID, req.ImageName)
 
-	// 5. Create the VM Directory (This signals "VM existence" for /vms)
-	if err := os.MkdirAll(vmPath, 0755); err != nil {
-		log.Printf("Failed to create VM directory %s: %v", vmPath, err)
+	// 5. Create the VM Directory
+	if err := os.MkdirAll(paths.vmRootPath, 0755); err != nil {
+		log.Printf("Failed to create VM directory %s: %v", paths.vmRootPath, err)
 		http.Error(w, fmt.Sprintf("Failed to create VM directory: %v", err), http.StatusInternalServerError)
 		return
 	}
+	log.Printf("Provisioning VM %s in %s", req.VMID, paths.vmRootPath)
 
-	log.Printf("Provisioning VM %s using image %s located at %s", req.VMID, req.ImageName, imagePath)
+	// Provisioning steps (must be synchronous)
+	if _, err := copyFile(paths.imageDiskSourcePath, paths.vmDiskDestPath); err != nil {
+		log.Printf("VM %s DISK copy failed: %v. Cleaning up directory.", req.VMID, err)
+		os.RemoveAll(paths.vmRootPath)
+		http.Error(w, fmt.Sprintf("DISK copy failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("Copied %s to %s", paths.imageDiskSourcePath, paths.vmDiskDestPath)
 
-	// 6. Execute macosvm create/run commands
-	go func() {
-		defer mutex.Unlock()
-		mutex.Lock()
+	if _, err := copyFile(paths.imageAuxSourcePath, paths.vmAuxDestPath); err != nil {
+		log.Printf("VM %s AUX copy failed: %v. Cleaning up directory.", req.VMID, err)
+		os.RemoveAll(paths.vmRootPath)
+		http.Error(w, fmt.Sprintf("AUX copy failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("Copied %s to %s", paths.imageAuxSourcePath, paths.vmAuxDestPath)
 
-		logFile := filepath.Join(vmPath, "vm.log")
+	// 5. Create Configuration Content using Go struct (addressing user request 1 & 2)
+	config := VMConfig{
+		// Hardcoded value for hardwareModel needed by macosvm
+		HardwareModel: "YnBsaXN0MDDRAQJURUNYWFZlWlhvWEtTWFpZcmZlWmdYSlh4Y3l5Y29YSlh4Y3l5Y29YSlh4Y3l5Y29XRFdEUjIwVFlfU0hPcnJvdHRlckFycGltZQAAAAABt",
+		Storage: []StorageDevice{
+			{Type: "disk", File: paths.vmDiskDestPath, ReadOnly: false}, // **Absolute Path**
+			{Type: "aux", File: paths.vmAuxDestPath, ReadOnly: false},   // **Absolute Path**
+		},
+		RAM:       4294967296, // 4GB
+		MachineID: machineID,
+		Displays: []DisplayConfig{
+			{DPI: 200, Width: 2560, Height: 1600},
+		},
+		Version: 1,
+		CPUs:    4,
+		Networks: []NetworkConfig{
+			{Type: "nat"},
+		},
+		Audio: false,
+	}
 
-		// 6a. macosvm create
-		// NOTE: Please confirm the correct flag for injecting the base64-encoded machine ID.
-		// We are using -machine-identifier as a placeholder.
-		createArgs := []string{
-			"create",
-			"-name", req.VMID,
-			"-path", vmPath,
-			"-disk", imagePath,
-			"-machine-identifier", machineID, // <-- UNIQUE ID INJECTION
-		}
+	// Marshal the struct to pretty-printed JSON
+	configContent, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		log.Printf("VM %s failed to marshal config struct: %v. Cleaning up directory.", req.VMID, err)
+		os.RemoveAll(paths.vmRootPath)
+		http.Error(w, fmt.Sprintf("Failed to generate config JSON: %v", err), http.StatusInternalServerError)
+		return
+	}
 
-		if err := runCommand("macosvm", createArgs...); err != nil {
-			log.Printf("VM %s macosvm create failed: %v", req.VMID, err)
-			return
-		}
+	// Write config.json
+	if err := os.WriteFile(paths.vmConfigPath, configContent, 0644); err != nil {
+		log.Printf("VM %s failed to write config.json: %v. Cleaning up directory.", req.VMID, err)
+		os.RemoveAll(paths.vmRootPath)
+		http.Error(w, fmt.Sprintf("Failed to write config.json: %v", err), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("Wrote VM configuration file: %s", paths.vmConfigPath)
 
-		// 6b. macosvm run
-		runArgs := []string{"run", "-name", req.VMID, "-path", vmPath, "-logfile", logFile}
-		if err := runCommand("macosvm", runArgs...); err != nil {
-			log.Printf("VM %s macosvm run failed: %v", req.VMID, err)
-		}
-	}()
+	// 6. Start the VM process in the background
+	if err := startVMInBackground(req.VMID, paths); err != nil {
+		log.Printf("VM %s failed to start background process: %v. Cleaning up directory.", req.VMID, err)
+		os.RemoveAll(paths.vmRootPath)
+		http.Error(w, fmt.Sprintf("Failed to start VM: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusAccepted) // 202 Accepted: Provisioning has begun
 	json.NewEncoder(w).Encode(map[string]string{
-		"message": fmt.Sprintf("VM provisioning initiated for %s. Unique machine ID generated.", req.VMID),
+		"message": fmt.Sprintf("VM provisioning and start initiated for %s. Process running in background.", req.VMID),
 		"vmId":    req.VMID,
-		"vmPath":  vmPath,
+		"vmPath":  paths.vmRootPath,
 	})
 }
 
-// handleDeleteVM deletes a VM and its associated files.
+// handleDeleteVM deletes a VM and its associated files, including terminating the process.
 func handleDeleteVM(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -348,25 +495,47 @@ func handleDeleteVM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vmPath := filepath.Join(vmRootDir, "vm_"+req.VMID)
+	// Get Paths (image name is not required for deletion)
+	paths := getVMPaths(req.VMID, "")
 
-	log.Printf("Attempting to delete VM %s at path %s", req.VMID, vmPath)
+	log.Printf("Attempting to delete VM %s at path %s", req.VMID, paths.vmRootPath)
 
-	// Delete the VM directory and all contents
+	// Delete the VM directory and all contents in a background goroutine
 	go func() {
 		defer mutex.Unlock()
 		mutex.Lock()
 
-		if err := os.RemoveAll(vmPath); err != nil {
-			log.Printf("CRITICAL: Failed to delete VM directory %s: %v", vmPath, err)
+		// 1. Try to kill the running process using the recorded PID
+		pidBytes, err := os.ReadFile(paths.vmPIDPath)
+		if err == nil {
+			pid := strings.TrimSpace(string(pidBytes))
+			log.Printf("Found PID %s for VM %s. Attempting to kill process...", pid, req.VMID)
+
+			// Execute kill -9 <PID>
+			killCmd := exec.Command("kill", "-9", pid)
+			if killErr := killCmd.Run(); killErr != nil {
+				// The kill command fails if the process is already gone, which is expected and acceptable.
+				log.Printf("VM %s: Kill command failed (process likely already stopped): %v", req.VMID, killErr)
+			} else {
+				log.Printf("VM %s: Successfully sent KILL signal to PID %s.", req.VMID, pid)
+			}
+		} else if !os.IsNotExist(err) {
+			log.Printf("VM %s: Warning: Could not read PID file %s: %v. Proceeding with directory removal.", req.VMID, paths.vmPIDPath, err)
 		} else {
-			log.Printf("Successfully deleted VM directory: %s", vmPath)
+			log.Printf("VM %s: PID file %s not found. Process likely stopped already. Proceeding with directory removal.", req.VMID, paths.vmPIDPath)
+		}
+
+		// 2. Delete the VM directory and all contents
+		if err := os.RemoveAll(paths.vmRootPath); err != nil {
+			log.Printf("CRITICAL: Failed to delete VM directory %s: %v", paths.vmRootPath, err)
+		} else {
+			log.Printf("Successfully deleted VM directory: %s", paths.vmRootPath)
 		}
 	}()
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{
-		"message": fmt.Sprintf("VM deletion for %s initiated (directory removal).", req.VMID),
+		"message": fmt.Sprintf("VM deletion for %s initiated (process termination and directory removal).", req.VMID),
 		"vmId":    req.VMID,
 	})
 }
@@ -385,7 +554,7 @@ func main() {
 	r.HandleFunc("/delete-vm", handleDeleteVM).Methods("POST")
 
 	port := "8081"
-	log.Printf("MacVM Agent (Filesystem-Checked with Unique ID) starting on :%s", port)
+	log.Printf("MacVM Agent (Manual Provisioning and NodeID) starting on :%s", port)
 
 	server := &http.Server{
 		Addr:         ":" + port,
