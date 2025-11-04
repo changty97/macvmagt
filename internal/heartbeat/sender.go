@@ -3,7 +3,7 @@ package heartbeat
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"time"
@@ -12,75 +12,70 @@ import (
 	"github.com/changty97/macvmagt/internal/imagemgr"
 	"github.com/changty97/macvmagt/internal/models"
 	"github.com/changty97/macvmagt/internal/utils"
-	"github.com/changty97/macvmagt/internal/vmgr"
+	"github.com/changty97/macvmagt/internal/vmgr" // Import VM manager
 )
 
-// Sender is responsible for collecting system info and sending heartbeats.
+// Sender handles sending periodic heartbeats to the orchestrator.
 type Sender struct {
 	cfg          *config.Config
-	imageManager *imagemgr.Manager
-	vmManager    *vmgr.Manager
+	vmManager    *vmgr.VMManager
+	imageManager *imagemgr.ImageManager
+	httpClient   *http.Client
 }
 
 // NewSender creates a new Heartbeat Sender.
-func NewSender(cfg *config.Config, im *imagemgr.Manager, vmm *vmgr.Manager) *Sender {
+func NewSender(cfg *config.Config, vmm *vmgr.VMManager, imm *imagemgr.ImageManager) *Sender {
 	return &Sender{
 		cfg:          cfg,
-		imageManager: im,
 		vmManager:    vmm,
+		imageManager: imm,
+		httpClient:   &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
-// StartSendingHeartbeats periodically collects data and sends it to the orchestrator.
+// StartSendingHeartbeats starts a goroutine that periodically sends heartbeats.
 func (s *Sender) StartSendingHeartbeats() {
 	ticker := time.NewTicker(s.cfg.HeartbeatInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		s.sendHeartbeat()
+		s.SendHeartbeat()
 	}
 }
 
-func (s *Sender) sendHeartbeat() {
-	cpuUsage, err := utils.GetCPUUsage()
-	if err != nil {
-		log.Printf("Error getting CPU usage: %v", err)
-		cpuUsage = 0.0 // Report 0 or previous value on error
-	}
+// SendHeartbeat collects current node status and sends it to the orchestrator.
+func (s *Sender) SendHeartbeat() {
+	cpuUsage := utils.GetCPUUsage()
+	memUsed, memTotal := utils.GetMemoryUsage()
+	diskUsed, diskTotal := utils.GetDiskUsage()
+	runningVMs := s.vmManager.GetRunningVMs()
+	cachedImages := s.imageManager.GetCachedImages()
 
-	memUsed, memTotal, err := utils.GetMemoryUsage()
-	if err != nil {
-		log.Printf("Error getting memory usage: %v", err)
-		memUsed = 0.0
-		memTotal = 0.0
+	// Update runtime for running VMs before sending heartbeat
+	for i := range runningVMs {
+		// This is a simplified update. In a real system, you'd need to query
+		// tart for actual VM uptime or track it from VM start time.
+		// For now, we'll just increment a dummy counter or rely on tart's reporting.
+		// For this example, we'll just assume the VMInfo in vmManager is kept up-to-date
+		// by parsing `tart list` output periodically or on VM start.
+		// For the purpose of this demo, we'll leave it as 0 or a fixed value.
+		// A real implementation would involve polling tart or tracking start time.
+		// Let's make a simple assumption for demonstration:
+		if runningVMs[i].VMStartTime != nil {
+			runningVMs[i].RuntimeSeconds = int64(time.Since(*runningVMs[i].VMStartTime).Seconds())
+		}
 	}
-
-	diskUsed, diskTotal, err := utils.GetDiskUsage()
-	if err != nil {
-		log.Printf("Error getting disk usage: %v", err)
-		diskUsed = 0.0
-		diskTotal = 0.0
-	}
-
-	runningVMs, err := utils.GetRunningVMs() // Use vmutils to get detailed VM info
-	if err != nil {
-		log.Printf("Error getting running VMs: %v", err)
-		runningVMs = []models.VMInfo{}
-	}
-	vmCount := len(runningVMs)
-
-	cachedImages := s.imageManager.GetCachedImageNames()
 
 	payload := models.HeartbeatPayload{
 		NodeID:          s.cfg.NodeID,
-		VMCount:         vmCount,
+		VMCount:         len(runningVMs),
 		VMs:             runningVMs,
 		CPUUsagePercent: cpuUsage,
 		MemoryUsageGB:   memUsed,
 		TotalMemoryGB:   memTotal,
 		DiskUsageGB:     diskUsed,
 		TotalDiskGB:     diskTotal,
-		Status:          "healthy", // Determine status based on thresholds later
+		Status:          "healthy", // Agent's self-reported status
 		CachedImages:    cachedImages,
 	}
 
@@ -90,16 +85,17 @@ func (s *Sender) sendHeartbeat() {
 		return
 	}
 
-	resp, err := http.Post(fmt.Sprintf("%s/api/heartbeat", s.cfg.OrchestratorURL), "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := s.httpClient.Post(s.cfg.OrchestratorURL+"/api/heartbeat", "application/json", bytes.NewBuffer(jsonPayload))
 	if err != nil {
-		log.Printf("Error sending heartbeat to orchestrator: %v", err)
+		log.Printf("Error sending heartbeat to orchestrator %s: %v", s.cfg.OrchestratorURL, err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("Received non-OK response for heartbeat: %s", resp.Status)
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("Orchestrator returned non-200 status for heartbeat: %s, body: %s", resp.Status, string(bodyBytes))
 	} else {
-		log.Printf("Heartbeat sent successfully from NodeID: %s", s.cfg.NodeID)
+		log.Printf("Heartbeat sent successfully to orchestrator %s", s.cfg.OrchestratorURL)
 	}
 }
